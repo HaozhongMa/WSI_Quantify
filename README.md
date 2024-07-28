@@ -29,3 +29,15 @@ For training, the data need to be arranged in the following order:
 ## WSI_Segmentation
 
 `python WSI_predict.py --dataset  WSI`
+
+
+## Dataset
+The original WSI images cannot be provided because these images are patient's private information
+
+
+# Example
+git clone https://github.com/HaozhongMa/WSI_Quantify.git
+
+cd WSI_Quantify
+
+pip install -r requirements.txt
