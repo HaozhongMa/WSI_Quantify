@@ -24,15 +24,17 @@ For training, the data need to be arranged in the following order:
 
 ## Train CNN
 
-`python train.py --dataset  path`
+`python train.py --dataset  data_path`
 
 ## WSI_Segmentation
 
-`python WSI_predict.py --dataset  WSI`
+`python WSI_predict.py --WSI  WSI_path`
 
 
 ## Dataset
-The original WSI images cannot be provided because these images are patient's private information
+The original WSI images cannot be provided because these images are patient's private information.
+
+Training data can be obtained by contacting the corresponding author.
 
 
 # Example
