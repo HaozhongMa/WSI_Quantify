@@ -9,6 +9,10 @@ environments can be `conda` create:
 
 `conda env create -f environments.yaml`
 
+or `pip` install:
+
+`pip install -r requirements.txt`
+
 
 ## Training Data
 
@@ -38,6 +42,7 @@ Training data can be obtained by contacting the corresponding author.
 
 
 # Example
+
 git clone https://github.com/HaozhongMa/WSI_Quantify.git
 
 cd WSI_Quantify
