@@ -28,11 +28,11 @@ For training, the data need to be arranged in the following order:
 
 ## Train CNN
 
-`python train.py --dataset  data_path`
+```python train.py --dataset  data_path```
 
 ## WSI_Segmentation
 
-`python WSI_predict.py --WSI  WSI_path`
+```python WSI_predict.py --WSI  WSI_path```
 
 
 ## Dataset
@@ -42,9 +42,16 @@ Training data can be obtained by contacting the corresponding author.
 
 
 # Example
-
+For example, in Linux:
+```
 git clone https://github.com/HaozhongMa/WSI_Quantify.git
 
 cd WSI_Quantify
 
 pip install -r requirements.txt
+
+python train.py --dataset  data_path
+
+python WSI_predict.py --WSI  WSI_path
+```
+
