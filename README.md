@@ -3,25 +3,22 @@ Tumor-infiltrating lymphocytes (TILs), which are lymphocytes located within and 
 
 
 ## Prerequisites
-Python 3.10
-
-environments can be `conda` create:
-
-`conda env create -f environments.yaml`
-
-or `pip` install:
-
-`pip install -r requirements.txt`
-
-or
-
-Install PyTorch for your CUDA or CPU environment first, then install the remaining Python dependencies:
+Create the tested CUDA 12.1 conda environment:
 
 ```bash
-pip install numpy pillow matplotlib scikit-learn seaborn tqdm scipy openslide-python timm huggingface_hub
+conda env create -f environments.yaml
+conda activate wsi-quantify-pytorch121
 ```
 
-`8class-WSI-quantify.py` also requires the system OpenSlide library. Install it with your platform package manager before using `openslide-python`.
+Or install with pip:
+
+```bash
+pip install -r requirements.txt
+```
+
+The environment files are based on the server `pytorch121` setup used for CNN/Transformer training and CONCH probes.
+
+`8class-WSI-quantify.py` also requires the OpenSlide library. The conda file includes `openslide`, and the pip file includes `openslide-bin`; if those binary packages do not work on your platform, install OpenSlide with your system package manager before using `openslide-python`.
 
 The CONCH, TITAN, and UNI workflows require their corresponding local model files. Place them under `models/` or pass explicit paths with command-line arguments.
 
