@@ -3,7 +3,7 @@ Tumor-infiltrating lymphocytes (TILs), which are lymphocytes located within and 
 
 
 ## Prerequisites
-Python 3.8
+Python 3.10
 
 environments can be `conda` create:
 
