@@ -12,7 +12,6 @@ import types
 from collections import OrderedDict
 from pathlib import Path
 from typing import Sequence
-
 import matplotlib
 
 matplotlib.use("Agg")
