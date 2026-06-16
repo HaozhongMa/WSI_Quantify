@@ -14,8 +14,6 @@ import argparse
 import csv
 import scipy.ndimage
 
-# Optimized version generated from 8class-WSI-quantify.py.
-# v2: fail-safe tissue prefilter; automatically falls back when low-resolution levels are unavailable or unreadable.
 
 # --- Constants ---
 class_map = {
