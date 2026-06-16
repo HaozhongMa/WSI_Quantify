@@ -14,7 +14,6 @@ import argparse
 import csv
 import scipy.ndimage
 
-
 # --- Constants ---
 class_map = {
     'Adipose': 0, 'Background': 1, 'Debris': 2, 'Lymphocytes': 3,
