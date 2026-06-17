@@ -14,7 +14,6 @@ import argparse
 import csv
 import scipy.ndimage
 
-
 # --- Constants ---
 class_map = {
     'Adipose': 0, 'Background': 1, 'Debris': 2, 'Lymphocytes': 3,
@@ -752,11 +751,11 @@ def build_count_metrics(wsi_name, model_type, counts_dict):
     lymphocytes_count = class_counts["Lymphocytes"]
     tumor_lymphocyte_count = class_counts["Tumor_Relate_Lymphocytes"]
 
-    lsr = safe_divide(
+    all_lym_str_rat = safe_divide(
         lymphocytes_count + tumor_lymphocyte_count,
         stroma_count + lymphocytes_count + tumor_lymphocyte_count,
     )
-    new_lsr = safe_divide(
+    lsr = safe_divide(
         tumor_lymphocyte_count,
         stroma_count + tumor_lymphocyte_count,
     )
@@ -768,8 +767,8 @@ def build_count_metrics(wsi_name, model_type, counts_dict):
     }
     for class_name in class_map:
         row[f"{class_name}_count"] = class_counts[class_name]
+    row["all-lym-str-rate"] = all_lym_str_rat
     row["LSR"] = lsr
-    row["NEW_LSR"] = new_lsr
     return row
 
 
@@ -779,8 +778,8 @@ def save_metrics_csv(metrics_path, metrics_row):
         "model_type",
         "total_count",
         *[f"{class_name}_count" for class_name in class_map],
+        "all-lym-str-rate",
         "LSR",
-        "NEW_LSR",
     ]
     with open(metrics_path, "w", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -962,7 +961,10 @@ def main():
     save_metrics_csv(metrics_path, metrics_row)
     
     print(f"Saved metrics to {metrics_path}")
-    print(f"LSR={metrics_row['LSR']:.8f}, NEW_LSR={metrics_row['NEW_LSR']:.8f}")
+    print(
+        f"all-lym-str-rate={metrics_row['all-lym-str-rate']:.8f}, "
+        f"LSR={metrics_row['LSR']:.8f}"
+    )
 
 if __name__ == '__main__':
     main()
