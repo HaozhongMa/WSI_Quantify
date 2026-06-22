@@ -3,7 +3,7 @@ Tumor-infiltrating lymphocytes (TILs), which are lymphocytes located within and 
 
 
 ## Prerequisites
-Create the tested CUDA 12.1 conda environment:
+Create the CUDA 12.1 conda environment:
 
 ```bash
 conda env create -f environments.yaml
@@ -15,8 +15,6 @@ Or install with pip:
 ```bash
 pip install -r requirements.txt
 ```
-
-The environment files are based on the server `pytorch121` setup used for CNN/Transformer training and CONCH probes.
 
 `8class-WSI-quantify.py` also requires the OpenSlide library. The conda file includes `openslide`, and the pip file includes `openslide-bin`; if those binary packages do not work on your platform, install OpenSlide with your system package manager before using `openslide-python`.
 
