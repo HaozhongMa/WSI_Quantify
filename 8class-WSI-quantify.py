@@ -24,10 +24,11 @@ class_map = {
 label_to_name = {v: k for k, v in class_map.items()}
 
 EXPECTED_CONCH_CLASSES = ["ADI", "BAC", "DEB", "LYM", "MUS", "NOR", "STR", "TUM"]
-DEFAULT_RESNET50_MODEL_PATH = os.environ.get("WSI_RESNET50_MODEL_PATH")
-DEFAULT_CONCH_MODEL_DIR = os.environ.get("CONCH_MODEL_DIR")
-DEFAULT_CONCH_HEAD_PATH = os.environ.get("WSI_CONCH_HEAD_PATH")
-DEFAULT_VIT_B_16_MODEL_PATH = os.environ.get("WSI_VIT_B_16_MODEL_PATH")
+NUM_MODEL_CLASSES = len(EXPECTED_CONCH_CLASSES)
+DEFAULT_RESNET50_MODEL_PATH = os.environ.get("RESNET50_MODEL_PATH", "checkpoints/8class_resnet50.pth")
+DEFAULT_CONCH_MODEL_DIR = os.environ.get("CONCH_MODEL_DIR", "models/CONCH")
+DEFAULT_CONCH_HEAD_PATH = os.environ.get("CONCH_HEAD_PATH", "checkpoints/conch_mlp_probe.pt")
+DEFAULT_VIT_B_16_MODEL_PATH = os.environ.get("VIT_B_16_MODEL_PATH", "checkpoints/8class_vit_b_16.pth")
 
 LABEL_COLORS = {
     0: (246, 227, 109),    # Adipose
@@ -232,10 +233,15 @@ def get_slide_mpp(slide):
 
 
 def build_all_coords(width, height, tile_size, step):
-    n_rows = (height - tile_size) // step + 1
-    n_cols = (width - tile_size) // step + 1
-    coords = [(c * step, r * step) for r in range(n_rows) for c in range(n_cols)]
-    return coords, n_rows, n_cols
+    # The output is a spatial grid with one cell per stride, not one cell per
+    # tile origin. A tile therefore covers every grid cell intersecting its
+    # tile_size x tile_size footprint (2 x 2 cells for tile_size=224, step=112).
+    output_rows = int(np.ceil(height / step))
+    output_cols = int(np.ceil(width / step))
+    tile_rows = max(0, (height - tile_size) // step + 1)
+    tile_cols = max(0, (width - tile_size) // step + 1)
+    coords = [(c * step, r * step) for r in range(tile_rows) for c in range(tile_cols)]
+    return coords, output_rows, output_cols
 
 
 def build_tissue_coords(
@@ -370,6 +376,70 @@ def run_model_forward(model_type, imgs, model, encoder, head, normalize_features
     return model(imgs)
 
 
+def accumulate_tile_probabilities(
+    probability_sums,
+    coverage_counts,
+    tile_probabilities,
+    xs,
+    ys,
+    tile_size,
+    step,
+):
+    """Accumulate each tile's class probabilities over its spatial footprint."""
+    tile_probabilities = np.asarray(tile_probabilities, dtype=np.float32)
+    xs = np.asarray(xs, dtype=np.int64)
+    ys = np.asarray(ys, dtype=np.int64)
+
+    if tile_probabilities.ndim != 2 or tile_probabilities.shape[1] != NUM_MODEL_CLASSES:
+        raise ValueError(
+            f"Expected tile probabilities with shape (N, {NUM_MODEL_CLASSES}), "
+            f"got {tile_probabilities.shape}."
+        )
+    if tile_probabilities.shape[0] != xs.size or xs.size != ys.size:
+        raise ValueError("Tile probabilities and coordinates must contain the same number of tiles.")
+
+    row_origins = ys // step
+    col_origins = xs // step
+    grid_span = int(np.ceil(tile_size / step))
+    n_rows, n_cols = coverage_counts.shape
+
+    # np.add.at is required because several tiles can address the same output
+    # cell in one batch. Ordinary advanced-index += may lose repeated updates.
+    for row_offset in range(grid_span):
+        rows = row_origins + row_offset
+        valid_rows = rows < n_rows
+        for col_offset in range(grid_span):
+            cols = col_origins + col_offset
+            valid = valid_rows & (cols < n_cols)
+            if not np.any(valid):
+                continue
+            np.add.at(
+                probability_sums,
+                (rows[valid], cols[valid]),
+                tile_probabilities[valid],
+            )
+            np.add.at(coverage_counts, (rows[valid], cols[valid]), 1)
+
+
+def fuse_probability_map(probability_sums, coverage_counts):
+    """Average overlapping predictions and return one deterministic label per cell."""
+    label_matrix = np.full(
+        coverage_counts.shape,
+        class_map['Background'],
+        dtype=np.int8,
+    )
+    covered = coverage_counts > 0
+    if not np.any(covered):
+        return label_matrix
+
+    mean_probabilities = (
+        probability_sums[covered]
+        / coverage_counts[covered, np.newaxis].astype(np.float32)
+    )
+    label_matrix[covered] = np.argmax(mean_probabilities, axis=1).astype(np.int8)
+    return label_matrix
+
+
 def generate_label_matrix(
     slide_path,
     model_type,
@@ -393,7 +463,12 @@ def generate_label_matrix(
     amp=True,
 ):
     """
-    Runs inference and returns a 2D matrix of labels representing the WSI.
+    Runs inference and returns a fused, single-label spatial map of the WSI.
+
+    The eight-class softmax vector from every tile is accumulated over all
+    stride-grid cells covered by that tile. At each covered cell, accumulated
+    probabilities are divided by the actual number of contributing tiles and
+    the class with the highest mean probability becomes the unique label.
     Speed optimizations:
     1) low-resolution tissue prefilter to reduce level-0 reads;
     2) pinned memory + non_blocking GPU transfer;
@@ -424,9 +499,11 @@ def generate_label_matrix(
         coords, n_rows, n_cols = build_all_coords(w, h, tile_size, step)
         print(f"Tissue prefilter disabled: processing all {len(coords)} tiles")
 
-    label_matrix = np.full((n_rows, n_cols), class_map['Background'], dtype=np.int8)
+    probability_sums = np.zeros((n_rows, n_cols, NUM_MODEL_CLASSES), dtype=np.float32)
+    coverage_counts = np.zeros((n_rows, n_cols), dtype=np.uint32)
     if len(coords) == 0:
         print("No tissue tiles found. Returning all-background label matrix.")
+        label_matrix = fuse_probability_map(probability_sums, coverage_counts)
         return label_matrix, (w, h), step, slide_mpp
 
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
@@ -489,19 +566,40 @@ def generate_label_matrix(
                 imgs = imgs[valid_mask].to(device, non_blocking=True)
                 with torch.amp.autocast(device_type=device.type, enabled=amp and device.type == "cuda"):
                     outputs = run_model_forward(model_type, imgs, model, encoder, head, normalize_features)
-                preds = outputs.argmax(1).cpu().numpy()
-                row_indices = ys[valid_mask].numpy() // step
-                col_indices = xs[valid_mask].numpy() // step
-                label_matrix[row_indices, col_indices] = preds
+                probabilities = torch.softmax(outputs.float(), dim=1).cpu().numpy()
+                accumulate_tile_probabilities(
+                    probability_sums,
+                    coverage_counts,
+                    probabilities,
+                    xs[valid_mask].numpy(),
+                    ys[valid_mask].numpy(),
+                    tile_size,
+                    step,
+                )
         else:
             for imgs, xs, ys in tqdm(loader, desc="Inference"):
                 imgs = imgs.to(device, non_blocking=True)
                 with torch.amp.autocast(device_type=device.type, enabled=amp and device.type == "cuda"):
                     outputs = run_model_forward(model_type, imgs, model, encoder, head, normalize_features)
-                preds = outputs.argmax(1).cpu().numpy()
-                row_indices = ys.numpy() // step
-                col_indices = xs.numpy() // step
-                label_matrix[row_indices, col_indices] = preds
+                probabilities = torch.softmax(outputs.float(), dim=1).cpu().numpy()
+                accumulate_tile_probabilities(
+                    probability_sums,
+                    coverage_counts,
+                    probabilities,
+                    xs.numpy(),
+                    ys.numpy(),
+                    tile_size,
+                    step,
+                )
+
+    label_matrix = fuse_probability_map(probability_sums, coverage_counts)
+    covered_cells = int(np.count_nonzero(coverage_counts))
+    max_coverage = int(coverage_counts.max(initial=0))
+    print(
+        "Probability fusion: "
+        f"covered_cells={covered_cells}/{coverage_counts.size}, "
+        f"max_contributing_tiles={max_coverage}, output_grid={n_cols}x{n_rows}"
+    )
 
     try:
         slide.close()
@@ -522,102 +620,6 @@ def remove_small_components(binary_mask, min_size):
     keep_components[0] = False
     return keep_components[component_matrix]
 
-def make_disk_structure(radius_steps):
-    if radius_steps <= 0:
-        return np.ones((1, 1), dtype=bool)
-
-    y_coords, x_coords = np.ogrid[-radius_steps:radius_steps + 1, -radius_steps:radius_steps + 1]
-    return (x_coords * x_coords + y_coords * y_coords) <= (radius_steps * radius_steps)
-
-def detect_lymph_node_like_lymphocytes(
-    lymphocyte_mask,
-    step,
-    mpp,
-    density_radius_um=250.0,
-    min_density=0.35,
-    min_area_um2=200000.0,
-    min_extent_um=400.0,
-    closing_radius_um=100.0,
-):
-    """
-    Detects large, dense lymphocyte aggregates that are likely lymph-node-like regions.
-    Returned mask is restricted to original Lymphocytes tiles.
-    """
-    if step <= 0:
-        raise ValueError("step must be positive.")
-    if mpp <= 0:
-        raise ValueError("mpp must be positive.")
-    if not lymphocyte_mask.any():
-        return np.zeros_like(lymphocyte_mask, dtype=bool)
-    if density_radius_um <= 0:
-        raise ValueError("lymph_node_density_radius_um must be positive.")
-    if not 0 < min_density <= 1:
-        raise ValueError("lymph_node_min_density must be in (0, 1].")
-    if min_area_um2 <= 0:
-        raise ValueError("lymph_node_min_area_um2 must be positive.")
-    if min_extent_um <= 0:
-        raise ValueError("lymph_node_min_extent_um must be positive.")
-    if closing_radius_um < 0:
-        raise ValueError("lymph_node_closing_radius_um must be non-negative.")
-
-    step_um = step * mpp
-    density_radius_steps = max(1, int(np.ceil(density_radius_um / step_um)))
-    density_structure = make_disk_structure(density_radius_steps)
-    local_lymphocytes = scipy.ndimage.convolve(
-        lymphocyte_mask.astype(np.float32),
-        density_structure.astype(np.float32),
-        mode="constant",
-        cval=0.0,
-    )
-    local_window_area = scipy.ndimage.convolve(
-        np.ones_like(lymphocyte_mask, dtype=np.float32),
-        density_structure.astype(np.float32),
-        mode="constant",
-        cval=0.0,
-    )
-    local_density = local_lymphocytes / local_window_area
-    dense_seed_mask = lymphocyte_mask & (local_density >= min_density)
-
-    if not dense_seed_mask.any():
-        return np.zeros_like(lymphocyte_mask, dtype=bool)
-
-    aggregate_mask = dense_seed_mask
-    if closing_radius_um > 0:
-        closing_radius_steps = max(1, int(np.ceil(closing_radius_um / step_um)))
-        closing_structure = make_disk_structure(closing_radius_steps)
-        aggregate_mask = scipy.ndimage.binary_closing(aggregate_mask, structure=closing_structure)
-
-    component_matrix, component_count = scipy.ndimage.label(
-        aggregate_mask,
-        structure=np.ones((3, 3), dtype=bool),
-    )
-    if component_count == 0:
-        return np.zeros_like(lymphocyte_mask, dtype=bool)
-
-    lymph_node_like_mask = np.zeros_like(lymphocyte_mask, dtype=bool)
-    tile_area_um2 = step_um * step_um
-
-    for component_idx in range(1, component_count + 1):
-        component_lymphocytes = (component_matrix == component_idx) & lymphocyte_mask
-        component_tile_count = int(np.sum(component_lymphocytes))
-        if component_tile_count == 0:
-            continue
-
-        component_area_um2 = component_tile_count * tile_area_um2
-        if component_area_um2 < min_area_um2:
-            continue
-
-        rows, cols = np.where(component_lymphocytes)
-        height_um = (int(rows.max()) - int(rows.min()) + 1) * step_um
-        width_um = (int(cols.max()) - int(cols.min()) + 1) * step_um
-        short_axis_um = min(height_um, width_um)
-        if short_axis_um < min_extent_um:
-            continue
-
-        lymph_node_like_mask[component_lymphocytes] = True
-
-    return lymph_node_like_mask
-
 def define_tumor_related_lymphocytes(
     label_matrix,
     step,
@@ -625,12 +627,6 @@ def define_tumor_related_lymphocytes(
     radius_um=500.0,
     min_tumor_component_tiles=20,
     tumor_closing_radius=1,
-    enable_lymph_node_exclusion=True,
-    lymph_node_density_radius_um=250.0,
-    lymph_node_min_density=0.35,
-    lymph_node_min_area_um2=200000.0,
-    lymph_node_min_extent_um=400.0,
-    lymph_node_closing_radius_um=100.0,
 ):
     """
     Defines Tumor_Relate_Lymphocytes by physical proximity to reliable Tumour regions.
@@ -647,31 +643,6 @@ def define_tumor_related_lymphocytes(
     lymphocyte_mask = new_matrix == class_map['Lymphocytes']
     lymphocyte_count = int(np.sum(lymphocyte_mask))
 
-    if enable_lymph_node_exclusion:
-        lymph_node_like_mask = detect_lymph_node_like_lymphocytes(
-            lymphocyte_mask,
-            step=step,
-            mpp=mpp,
-            density_radius_um=lymph_node_density_radius_um,
-            min_density=lymph_node_min_density,
-            min_area_um2=lymph_node_min_area_um2,
-            min_extent_um=lymph_node_min_extent_um,
-            closing_radius_um=lymph_node_closing_radius_um,
-        )
-    else:
-        lymph_node_like_mask = np.zeros_like(lymphocyte_mask, dtype=bool)
-
-    lymph_node_like_count = int(np.sum(lymph_node_like_mask))
-    trl_candidate_mask = lymphocyte_mask & ~lymph_node_like_mask
-    trl_candidate_count = int(np.sum(trl_candidate_mask))
-    print(
-        "Lymph node-like exclusion: "
-        f"enabled={enable_lymph_node_exclusion}, "
-        f"total_lymphocytes={lymphocyte_count}, "
-        f"excluded_lymph_node_like={lymph_node_like_count}, "
-        f"retained_trl_candidates={trl_candidate_count}"
-    )
-
     reliable_tumor_mask = remove_small_components(tumor_mask, min_tumor_component_tiles)
     if tumor_closing_radius > 0 and reliable_tumor_mask.any():
         kernel_size = 2 * tumor_closing_radius + 1
@@ -681,26 +652,21 @@ def define_tumor_related_lymphocytes(
 
     reliable_tumor_count = int(np.sum(reliable_tumor_mask))
     if reliable_tumor_count == 0:
-        print(
-            "No reliable Tumour region found; "
-            "Tumor_Relate_Lymphocytes count is 0."
-        )
+        print("No reliable Tumour region found; Tumor_Relate_Lymphocytes count is 0.")
         return new_matrix
 
     step_um = step * mpp
     radius_steps = max(1, int(np.ceil(radius_um / step_um)))
     distance_to_tumor_steps = scipy.ndimage.distance_transform_edt(~reliable_tumor_mask)
-    tumor_related_mask = trl_candidate_mask & (distance_to_tumor_steps <= radius_steps)
+    tumor_related_mask = lymphocyte_mask & (distance_to_tumor_steps <= radius_steps)
 
     new_matrix[tumor_related_mask] = class_map['Tumor_Relate_Lymphocytes']
 
     tumor_related_count = int(np.sum(tumor_related_mask))
     print(
         "Tumor_Relate_Lymphocytes: "
-        f"{tumor_related_count}/{trl_candidate_count} retained Lymphocytes within "
+        f"{tumor_related_count}/{lymphocyte_count} Lymphocytes within "
         f"{radius_um:.1f} um ({radius_steps} grid steps) of reliable Tumour; "
-        f"total_lymphocytes={lymphocyte_count}, "
-        f"excluded_lymph_node_like={lymph_node_like_count}, "
         f"mpp={mpp:.4f}, step_um={step_um:.2f}, reliable_tumor_tiles={reliable_tumor_count}"
     )
     return new_matrix
@@ -742,7 +708,7 @@ def safe_divide(numerator, denominator):
     return numerator / denominator if denominator != 0 else 0.0
 
 
-def build_count_metrics(wsi_name, model_type, counts_dict):
+def build_count_metrics(wsi_name, model_type, counts_dict, step, mpp):
     class_counts = {
         class_name: int(counts_dict.get(class_idx, 0))
         for class_name, class_idx in class_map.items()
@@ -751,11 +717,11 @@ def build_count_metrics(wsi_name, model_type, counts_dict):
     lymphocytes_count = class_counts["Lymphocytes"]
     tumor_lymphocyte_count = class_counts["Tumor_Relate_Lymphocytes"]
 
-    all_lym_str_rat = safe_divide(
+    lsr = safe_divide(
         lymphocytes_count + tumor_lymphocyte_count,
         stroma_count + lymphocytes_count + tumor_lymphocyte_count,
     )
-    lsr = safe_divide(
+    new_lsr = safe_divide(
         tumor_lymphocyte_count,
         stroma_count + tumor_lymphocyte_count,
     )
@@ -764,11 +730,15 @@ def build_count_metrics(wsi_name, model_type, counts_dict):
         "WSI_name": wsi_name,
         "model_type": model_type,
         "total_count": sum(class_counts.values()),
+        "grid_cell_area_mm2": ((step * mpp) / 1000.0) ** 2,
     }
     for class_name in class_map:
         row[f"{class_name}_count"] = class_counts[class_name]
-    row["all-lym-str-rate"] = all_lym_str_rat
+        row[f"{class_name}_area_mm2"] = (
+            class_counts[class_name] * row["grid_cell_area_mm2"]
+        )
     row["LSR"] = lsr
+    row["NEW_LSR"] = new_lsr
     return row
 
 
@@ -777,9 +747,11 @@ def save_metrics_csv(metrics_path, metrics_row):
         "WSI_name",
         "model_type",
         "total_count",
+        "grid_cell_area_mm2",
         *[f"{class_name}_count" for class_name in class_map],
-        "all-lym-str-rate",
+        *[f"{class_name}_area_mm2" for class_name in class_map],
         "LSR",
+        "NEW_LSR",
     ]
     with open(metrics_path, "w", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -792,12 +764,12 @@ def main():
     parser.add_argument('--path', type=str, required=True)
     parser.add_argument('--out', type=str, required=True)
     parser.add_argument('--gpu_id', type=int, default=0)
-    parser.add_argument('--model_type', type=str, default='resnet50', choices=['resnet50', 'resnet5', 'conch', 'vit_b_16'],
+    parser.add_argument('--model_type', type=str, default='vit_b_16', choices=['resnet50', 'resnet5', 'conch', 'vit_b_16'],
                         help='Tile classifier backend. "resnet5" is accepted as an alias for resnet50.')
     parser.add_argument('--model', type=str, default=None,
-                        help='Checkpoint path for the selected model_type. If omitted, uses WSI_RESNET50_MODEL_PATH, WSI_CONCH_HEAD_PATH, or WSI_VIT_B_16_MODEL_PATH.')
+                        help='Checkpoint path for the selected model_type. Defaults to the ViT-B/16 checkpoint, CONCH MLP head, or ResNet50 checkpoint.')
     parser.add_argument('--conch_model_dir', type=str, default=DEFAULT_CONCH_MODEL_DIR,
-                        help='Directory containing local CONCH pytorch_model.bin weights. If omitted, uses CONCH_MODEL_DIR.')
+                        help='Directory containing local CONCH pytorch_model.bin weights.')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='Inference batch size. Defaults to 256 for all model types.')
     parser.add_argument('--step', '--step_size', dest='step_size', type=int, default=None,
@@ -812,18 +784,6 @@ def main():
                         help='Remove Tumour components smaller than this many grid tiles before TRL assignment.')
     parser.add_argument('--tumor_closing_radius', type=int, default=1,
                         help='Morphological closing radius, in grid steps, for reliable Tumour mask.')
-    parser.add_argument('--disable_lymph_node_exclusion', action='store_true',
-                        help='Disable lymph-node-like lymphocyte aggregate exclusion before TRL assignment.')
-    parser.add_argument('--lymph_node_density_radius_um', type=float, default=250.0,
-                        help='Physical radius used to estimate local Lymphocytes density for lymph-node-like exclusion.')
-    parser.add_argument('--lymph_node_min_density', type=float, default=0.35,
-                        help='Minimum local Lymphocytes density required for lymph-node-like aggregate seeds.')
-    parser.add_argument('--lymph_node_min_area_um2', type=float, default=200000.0,
-                        help='Minimum physical area for a dense lymphocyte aggregate to be treated as lymph-node-like.')
-    parser.add_argument('--lymph_node_min_extent_um', type=float, default=400.0,
-                        help='Minimum short-axis physical extent for lymph-node-like aggregate components.')
-    parser.add_argument('--lymph_node_closing_radius_um', type=float, default=100.0,
-                        help='Physical morphological closing radius used to connect dense lymphocyte aggregate seeds.')
     parser.add_argument('--tile_size', type=int, default=224,
                         help='Tile size in pixels. Keep 224 unless the model was trained with another size.')
     parser.add_argument('--num_workers', type=int, default=8,
@@ -876,14 +836,6 @@ def main():
             model_path = DEFAULT_VIT_B_16_MODEL_PATH
         else:
             model_path = DEFAULT_RESNET50_MODEL_PATH
-    if model_path is None:
-        env_var = {
-            "conch": "WSI_CONCH_HEAD_PATH",
-            "vit_b_16": "WSI_VIT_B_16_MODEL_PATH",
-        }.get(model_type, "WSI_RESNET50_MODEL_PATH")
-        raise ValueError(f"--model is required for model_type={model_type}, or set {env_var}.")
-    if model_type == "conch" and args.conch_model_dir is None:
-        raise ValueError("--conch_model_dir is required for model_type=conch, or set CONCH_MODEL_DIR.")
     batch_size = args.batch_size
     if batch_size is None:
         batch_size = 256
@@ -929,12 +881,6 @@ def main():
         radius_um=args.trl_radius_um,
         min_tumor_component_tiles=args.min_tumor_component_tiles,
         tumor_closing_radius=args.tumor_closing_radius,
-        enable_lymph_node_exclusion=not args.disable_lymph_node_exclusion,
-        lymph_node_density_radius_um=args.lymph_node_density_radius_um,
-        lymph_node_min_density=args.lymph_node_min_density,
-        lymph_node_min_area_um2=args.lymph_node_min_area_um2,
-        lymph_node_min_extent_um=args.lymph_node_min_extent_um,
-        lymph_node_closing_radius_um=args.lymph_node_closing_radius_um,
     )
 
     # 3. Count and Save
@@ -957,14 +903,17 @@ def main():
     else:
         print("Visualization saving skipped because --no_save_vis was set.")
 
-    metrics_row = build_count_metrics(WSI_name, model_type, counts_dict)
+    metrics_row = build_count_metrics(
+        WSI_name,
+        model_type,
+        counts_dict,
+        step=step,
+        mpp=effective_mpp,
+    )
     save_metrics_csv(metrics_path, metrics_row)
     
     print(f"Saved metrics to {metrics_path}")
-    print(
-        f"all-lym-str-rate={metrics_row['all-lym-str-rate']:.8f}, "
-        f"LSR={metrics_row['LSR']:.8f}"
-    )
+    print(f"LSR={metrics_row['LSR']:.8f}, NEW_LSR={metrics_row['NEW_LSR']:.8f}")
 
 if __name__ == '__main__':
     main()
