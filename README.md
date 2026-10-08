@@ -103,6 +103,9 @@ Use `--head-type linear` to train a linear probe instead of the default MLP head
 
 Run WSI inference with a trained ViT-B/16 checkpoint:
 
+Weights: 8class_final_vit.pth
+https://huggingface.co/haozhongma/WSI_Quantify/blob/main/8class_final_vit.pth
+
 ```bash
 python 8class-WSI-quantify.py \
   --path slides/example.svs \
